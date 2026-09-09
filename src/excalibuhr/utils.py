@@ -6,6 +6,7 @@ from astropy import stats
 from astropy import constants as const
 from astropy.modeling import models, fitting
 from numpy.polynomial import polynomial as Poly
+from numpy.polynomial import chebyshev as Cheb
 from scipy import ndimage, signal, optimize
 from scipy.interpolate import interp1d, InterpolatedUnivariateSpline
 from scipy.sparse import csc_matrix
@@ -1570,6 +1571,59 @@ def extract_spec(det, det_err, badpix, trace, slit, blaze, gain, NDIT=1,
 
     return flux, err, D, V, P 
 
+
+def extract_joint_spec(det, det_err, badpix, trace, slit, blaze, gain, NDIT=1,
+                       cen0=90, companion_sep=12.875, aper_half=28,
+                       psf_components=2, block_size=128,
+                       polynomial_degree=None,
+                       interpolate_psf=False,
+                       fit_individual_channels=False,
+                       background='constant', badpix_clip=5., debug=False):
+    """Extract primary and companion simultaneously with one shared PSF."""
+    im, im_err = spectral_rectify_interp(
+        [det, det_err], badpix, trace, slit, debug=False)
+    im, im_err = trace_rectify_interp([im, im_err], trace, debug=False)
+    im_subs, _ = im_order_cut(im, trace)
+    im_err_subs, _ = im_order_cut(im_err, trace)
+    bpm_subs, _ = im_order_cut(badpix, trace)
+
+    primary, primary_error, companion, companion_error, diagnostics = [], [], [], [], []
+    for order, (image, error, bpm) in enumerate(zip(im_subs, im_err_subs, bpm_subs)):
+        profile = np.nanmedian(image, axis=1)
+        profile[:10] = -np.inf
+        profile[-10:] = -np.inf
+        if cen0 is None:
+            center = int(np.nanargmax(profile))
+        else:
+            center = int(round(cen0))
+            search = np.full_like(profile, -np.inf)
+            lo, hi = max(0, center-4), min(len(profile), center+5)
+            search[lo:hi] = profile[lo:hi]
+            center = int(np.nanargmax(search))
+        lo = max(0, int(np.floor(center-companion_sep-aper_half)))
+        hi = min(image.shape[0], int(np.ceil(center+aper_half))+1)
+        data = image[lo:hi].T
+        variance = error[lo:hi].T**2
+        mask = bpm[lo:hi].T | ~np.isfinite(data) | ~np.isfinite(variance)
+        result = joint_psf_extraction(
+            data, variance, mask, obj_cen=center-lo,
+            companion_sep=companion_sep, psf_components=psf_components,
+            block_size=block_size, polynomial_degree=polynomial_degree,
+            interpolate_psf=interpolate_psf,
+            fit_individual_channels=fit_individual_channels,
+            background=background,
+            badpix_clip=badpix_clip)
+        f_primary, e_primary, f_companion, e_companion, diag = result
+        primary.append(f_primary/blaze[order])
+        primary_error.append(e_primary/blaze[order])
+        companion.append(f_companion/blaze[order])
+        companion_error.append(e_companion/blaze[order])
+        diag['spatial_offset'] = lo
+        diag['order'] = order
+        diagnostics.append(diag)
+
+    return primary, primary_error, companion, companion_error, diagnostics
+
         
 def optimal_extraction(D_full, V_full, bpm_full, obj_cen, 
                        aper_half=20, filter_mode='poly',
@@ -1810,6 +1864,358 @@ def optimal_extraction(D_full, V_full, bpm_full, obj_cen,
     f_opt = np.sum(M_bp*P*D/V_new, axis=1) / (np.sum(M_bp*P*P/V_new, axis=1) + etol)
 
     return f_opt, np.sqrt(var), D.T, V_new.T, P.T
+
+
+def gaussian_mixture_psf(spatial_x, centroid, widths, weights):
+    """Return a unit-sum concentric Gaussian-mixture spatial profile."""
+    spatial_x = np.asarray(spatial_x, dtype=float)
+    widths = np.asarray(widths, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    if (widths.ndim != 1 or weights.shape != widths.shape or
+            np.any(widths <= 0) or np.any(weights < 0) or weights.sum() <= 0):
+        raise ValueError("widths and weights must be positive one-dimensional arrays")
+    weights = weights / weights.sum()
+    profile = np.zeros_like(spatial_x)
+    for width, weight in zip(widths, weights):
+        profile += weight * np.exp(-0.5*((spatial_x-centroid)/width)**2) / width
+    total = profile.sum()
+    return profile / total if total > 0 else profile
+
+
+def _joint_psf_shape(parameters, n_components):
+    """Decode an identifiable PSF: ordered widths and positive unit-sum weights."""
+    centroid = parameters[0]
+    widths = [np.exp(parameters[1])]
+    for value in parameters[2:n_components+1]:
+        widths.append(widths[-1] + np.exp(value))
+    logits = np.r_[parameters[n_components+1:], 0.]
+    logits -= np.max(logits)
+    weights = np.exp(logits)
+    weights /= weights.sum()
+    return centroid, np.asarray(widths), weights
+
+
+def _weighted_linear_model(data, variance, mask, design):
+    """Weighted linear fit and covariance for one spatial cut."""
+    good = mask & np.isfinite(data) & np.isfinite(variance) & (variance > 0)
+    good &= np.all(np.isfinite(design), axis=1)
+    npar = design.shape[1]
+    if np.count_nonzero(good) <= npar:
+        return (np.full(npar, np.nan), np.full((npar, npar), np.nan),
+                np.full(data.shape, np.nan), np.nan)
+    matrix = design[good]
+    values = data[good]
+    inv_sigma = 1./np.sqrt(variance[good])
+    weighted_matrix = matrix*inv_sigma[:, None]
+    weighted_values = values*inv_sigma
+    coefficients, _, rank, _ = np.linalg.lstsq(weighted_matrix, weighted_values,
+                                                rcond=None)
+    if rank < npar:
+        return (np.full(npar, np.nan), np.full((npar, npar), np.nan),
+                np.full(data.shape, np.nan), np.nan)
+    model = design @ coefficients
+    chi2 = np.sum((values-matrix@coefficients)**2/variance[good])
+    dof = np.count_nonzero(good)-npar
+    chi2_reduced = chi2/dof if dof > 0 else np.nan
+    covariance = np.linalg.pinv(weighted_matrix.T @ weighted_matrix)
+    if np.isfinite(chi2_reduced) and chi2_reduced > 1:
+        covariance *= chi2_reduced
+    return coefficients, covariance, model, chi2_reduced
+
+
+def joint_psf_extraction(D_full, V_full, bpm_full, obj_cen,
+                         companion_sep=12.875, psf_components=2,
+                         block_size=128, polynomial_degree=None,
+                         interpolate_psf=False,
+                         fit_individual_channels=False,
+                         background='constant',
+                         badpix_clip=5., centroid_half_range=4.):
+    """Jointly extract two sources sharing a block-regularized Gaussian PSF.
+
+    Nonlinear centroid, Gaussian widths, and weights are estimated once per
+    wavelength block from its collapsed spatial profile. At each wavelength
+    pixel, independent primary/companion amplitudes and a constant or linear
+    background are then solved by weighted least squares. Returned errors are
+    covariance-derived and inflated by the per-cut reduced chi-squared when it
+    exceeds unity.
+    """
+    D = np.asarray(D_full, dtype=float)
+    V = np.asarray(V_full, dtype=float)
+    bad = np.asarray(bpm_full, dtype=bool)
+    if D.shape != V.shape or D.shape != bad.shape or D.ndim != 2:
+        raise ValueError("data, variance, and mask must share shape (wavelength, spatial)")
+    if psf_components < 1:
+        raise ValueError("psf_components must be at least one")
+    if block_size < 8:
+        raise ValueError("block_size must be at least eight pixels")
+    if polynomial_degree is not None and polynomial_degree < 0:
+        raise ValueError("polynomial_degree must be non-negative or None")
+    if polynomial_degree is not None and interpolate_psf:
+        raise ValueError("polynomial and profile-interpolated PSFs are mutually exclusive")
+    if background not in ('none', 'constant', 'linear'):
+        raise ValueError("background must be 'none', 'constant', or 'linear'")
+
+    nwave, nspatial = D.shape
+    spatial_x = np.arange(nspatial, dtype=float)
+    good = (~bad) & np.isfinite(D) & np.isfinite(V) & (V > 0)
+    primary = np.full(nwave, np.nan)
+    companion = np.full(nwave, np.nan)
+    primary_error = np.full(nwave, np.nan)
+    companion_error = np.full(nwave, np.nan)
+    model_primary = np.full_like(D, np.nan)
+    model_companion = np.full_like(D, np.nan)
+    model_background = np.full_like(D, np.nan)
+    residual = np.full_like(D, np.nan)
+    output_mask = ~good.copy()
+    chi2_reduced = np.full(nwave, np.nan)
+    block_parameters = []
+    independent_block_parameters = []
+    block_inputs = []
+
+    bg_columns = []
+    if background in ('constant', 'linear'):
+        bg_columns.append(np.ones(nspatial))
+    if background == 'linear':
+        bg_columns.append((spatial_x-np.mean(spatial_x))/max(nspatial-1, 1))
+
+    previous = None
+    for start in range(0, nwave, block_size):
+        stop = min(start+block_size, nwave)
+        block_good = good[start:stop]
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            collapsed = np.nanmedian(np.where(block_good, D[start:stop], np.nan), axis=0)
+            collapsed_var = np.nanmedian(np.where(block_good, V[start:stop], np.nan), axis=0)
+        collapsed_good = np.isfinite(collapsed) & np.isfinite(collapsed_var) & (collapsed_var > 0)
+
+        if previous is None:
+            base_width = 1.5
+            shape0 = [float(obj_cen), np.log(base_width)]
+            shape0 += [np.log(1.5)]*(psf_components-1)
+            shape0 += [0.]*(psf_components-1)
+            shape0 = np.asarray(shape0)
+        else:
+            shape0 = previous.copy()
+        lower = np.r_[obj_cen-centroid_half_range, np.log(0.5),
+                      [np.log(0.15)]*(psf_components-1),
+                      [-8.]*(psf_components-1)]
+        upper = np.r_[obj_cen+centroid_half_range, np.log(8.),
+                      [np.log(10.)]*(psf_components-1),
+                      [8.]*(psf_components-1)]
+
+        def shape_residual(parameters):
+            centroid, widths, weights = _joint_psf_shape(parameters, psf_components)
+            p_primary = gaussian_mixture_psf(spatial_x, centroid, widths, weights)
+            p_companion = gaussian_mixture_psf(
+                spatial_x, centroid-companion_sep, widths, weights)
+            design = np.column_stack([p_primary, p_companion] + bg_columns)
+            coefficients, _, model, _ = _weighted_linear_model(
+                collapsed, collapsed_var, collapsed_good, design)
+            if not np.all(np.isfinite(coefficients)):
+                return np.full(np.count_nonzero(collapsed_good), 1e6)
+            return ((collapsed-model)/np.sqrt(collapsed_var))[collapsed_good]
+
+        fit = optimize.least_squares(shape_residual, np.clip(shape0, lower, upper),
+                                     bounds=(lower, upper), loss='soft_l1')
+        previous = fit.x
+        independent_block_parameters.append(fit.x.copy())
+        block_inputs.append((collapsed, collapsed_var, collapsed_good))
+
+    independent_block_parameters = np.asarray(independent_block_parameters)
+    block_centers = np.asarray([
+        0.5*(start+min(start+block_size, nwave)-1)
+        for start in range(0, nwave, block_size)])
+    normalized_centers = 2.*block_centers/max(nwave-1, 1)-1.
+    if polynomial_degree is not None:
+        if len(block_centers) <= polynomial_degree:
+            raise ValueError("polynomial degree requires more wavelength blocks")
+        coefficients0 = np.column_stack([
+            Cheb.chebfit(normalized_centers,
+                         independent_block_parameters[:, parameter],
+                         polynomial_degree)
+            for parameter in range(independent_block_parameters.shape[1])])
+
+        def polynomial_residual(flat_coefficients):
+            coefficients = flat_coefficients.reshape(
+                polynomial_degree+1, independent_block_parameters.shape[1])
+            residuals = []
+            physical_penalties = []
+            for block_index, (collapsed, collapsed_var, collapsed_good) in enumerate(block_inputs):
+                parameters = np.asarray([
+                    Cheb.chebval(normalized_centers[block_index], coefficients[:, parameter])
+                    for parameter in range(coefficients.shape[1])])
+                centroid, widths, weights = _joint_psf_shape(parameters, psf_components)
+                physical_penalties.extend([
+                    100.*max(0., obj_cen-centroid_half_range-centroid),
+                    100.*max(0., centroid-(obj_cen+centroid_half_range)),
+                    100.*max(0., widths[-1]-12.),
+                ])
+                p_primary = gaussian_mixture_psf(spatial_x, centroid, widths, weights)
+                p_companion = gaussian_mixture_psf(
+                    spatial_x, centroid-companion_sep, widths, weights)
+                design = np.column_stack([p_primary, p_companion] + bg_columns)
+                linear, _, model, _ = _weighted_linear_model(
+                    collapsed, collapsed_var, collapsed_good, design)
+                if not np.all(np.isfinite(linear)):
+                    residuals.append(np.full(np.count_nonzero(collapsed_good), 1e6))
+                else:
+                    residuals.append(
+                        ((collapsed-model)/np.sqrt(collapsed_var))[collapsed_good])
+            return np.r_[np.concatenate(residuals), physical_penalties]
+
+        global_fit = optimize.least_squares(
+            polynomial_residual, coefficients0.ravel(), loss='soft_l1',
+            max_nfev=200)
+        polynomial_coefficients = global_fit.x.reshape(
+            polynomial_degree+1, independent_block_parameters.shape[1])
+        fitted_block_parameters = np.column_stack([
+            Cheb.chebval(normalized_centers, polynomial_coefficients[:, parameter])
+            for parameter in range(polynomial_coefficients.shape[1])])
+    else:
+        polynomial_coefficients = None
+        fitted_block_parameters = independent_block_parameters
+
+    interpolated_primary_psf = None
+    interpolated_companion_psf = None
+    if interpolate_psf:
+        primary_nodes, companion_nodes = [], []
+        for parameters in independent_block_parameters:
+            centroid, widths, weights = _joint_psf_shape(
+                parameters, psf_components)
+            primary_nodes.append(gaussian_mixture_psf(
+                spatial_x, centroid, widths, weights))
+            companion_nodes.append(gaussian_mixture_psf(
+                spatial_x, centroid-companion_sep, widths, weights))
+        primary_nodes = np.asarray(primary_nodes)
+        companion_nodes = np.asarray(companion_nodes)
+        pixels = np.arange(nwave, dtype=float)
+        interpolated_primary_psf = np.column_stack([
+            np.interp(pixels, block_centers, primary_nodes[:, spatial_pixel])
+            for spatial_pixel in range(nspatial)])
+        interpolated_companion_psf = np.column_stack([
+            np.interp(pixels, block_centers, companion_nodes[:, spatial_pixel])
+            for spatial_pixel in range(nspatial)])
+        interpolated_primary_psf = np.clip(interpolated_primary_psf, 0., None)
+        interpolated_companion_psf = np.clip(interpolated_companion_psf, 0., None)
+        interpolated_primary_psf /= interpolated_primary_psf.sum(axis=1)[:, None]
+        interpolated_companion_psf /= interpolated_companion_psf.sum(axis=1)[:, None]
+
+    for block_index, start in enumerate(range(0, nwave, block_size)):
+        stop = min(start+block_size, nwave)
+        fitted_parameters = fitted_block_parameters[block_index]
+        centroid, widths, weights = _joint_psf_shape(
+            fitted_parameters, psf_components)
+        p_primary = gaussian_mixture_psf(spatial_x, centroid, widths, weights)
+        p_companion = gaussian_mixture_psf(
+            spatial_x, centroid-companion_sep, widths, weights)
+        design = np.column_stack([p_primary, p_companion] + bg_columns)
+        block_parameters.append((start, stop, centroid, widths.copy(), weights.copy()))
+
+        for wave_index in range(start, stop):
+            if interpolate_psf:
+                wave_primary = interpolated_primary_psf[wave_index]
+                wave_companion = interpolated_companion_psf[wave_index]
+                wave_design = np.column_stack(
+                    [wave_primary, wave_companion] + bg_columns)
+            elif polynomial_coefficients is not None:
+                normalized_wave = 2.*wave_index/max(nwave-1, 1)-1.
+                wave_parameters = np.asarray([
+                    Cheb.chebval(normalized_wave,
+                                 polynomial_coefficients[:, parameter])
+                    for parameter in range(polynomial_coefficients.shape[1])])
+                wave_centroid, wave_widths, wave_weights = _joint_psf_shape(
+                    wave_parameters, psf_components)
+                wave_primary = gaussian_mixture_psf(
+                    spatial_x, wave_centroid, wave_widths, wave_weights)
+                wave_companion = gaussian_mixture_psf(
+                    spatial_x, wave_centroid-companion_sep,
+                    wave_widths, wave_weights)
+                wave_design = np.column_stack(
+                    [wave_primary, wave_companion] + bg_columns)
+            else:
+                wave_primary, wave_companion = p_primary, p_companion
+                wave_design = design
+            mask = good[wave_index].copy()
+            coefficients, covariance, model, reduced = _weighted_linear_model(
+                D[wave_index], V[wave_index], mask, wave_design)
+            if np.all(np.isfinite(coefficients)) and badpix_clip is not None:
+                pull = np.full(nspatial, np.nan)
+                np.divide(np.abs(D[wave_index]-model), np.sqrt(V[wave_index]),
+                          out=pull, where=np.isfinite(V[wave_index]) &
+                          (V[wave_index] > 0))
+                mask &= ~(np.isfinite(pull) & (pull > badpix_clip))
+                coefficients, covariance, model, reduced = _weighted_linear_model(
+                    D[wave_index], V[wave_index], mask, wave_design)
+            if not np.all(np.isfinite(coefficients[:2])):
+                continue
+            primary[wave_index], companion[wave_index] = coefficients[:2]
+            primary_error[wave_index] = np.sqrt(max(covariance[0, 0], 0.))
+            companion_error[wave_index] = np.sqrt(max(covariance[1, 1], 0.))
+            model_primary[wave_index] = coefficients[0]*wave_primary
+            model_companion[wave_index] = coefficients[1]*wave_companion
+            if bg_columns:
+                model_background[wave_index] = wave_design[:, 2:] @ coefficients[2:]
+            else:
+                model_background[wave_index] = 0.
+            residual[wave_index] = D[wave_index]-model
+            output_mask[wave_index] = ~mask
+            chi2_reduced[wave_index] = reduced
+
+    individual_channel_parameters = None
+    individual_channel_cost = None
+    if fit_individual_channels:
+        individual_channel_parameters = np.full(
+            (nwave, independent_block_parameters.shape[1]), np.nan)
+        individual_channel_cost = np.full(nwave, np.nan)
+        for wave_index in range(nwave):
+            normalized_wave = 2.*wave_index/max(nwave-1, 1)-1.
+            if polynomial_coefficients is not None:
+                initial = np.asarray([
+                    Cheb.chebval(normalized_wave,
+                                 polynomial_coefficients[:, parameter])
+                    for parameter in range(polynomial_coefficients.shape[1])])
+            else:
+                initial = fitted_block_parameters[
+                    min(wave_index//block_size, len(fitted_block_parameters)-1)]
+
+            def channel_residual(parameters):
+                centroid, widths, weights = _joint_psf_shape(
+                    parameters, psf_components)
+                channel_primary = gaussian_mixture_psf(
+                    spatial_x, centroid, widths, weights)
+                channel_companion = gaussian_mixture_psf(
+                    spatial_x, centroid-companion_sep, widths, weights)
+                channel_design = np.column_stack(
+                    [channel_primary, channel_companion] + bg_columns)
+                linear, _, model, _ = _weighted_linear_model(
+                    D[wave_index], V[wave_index], good[wave_index], channel_design)
+                if not np.all(np.isfinite(linear)):
+                    return np.full(np.count_nonzero(good[wave_index]), 1e6)
+                channel_pull = np.full(nspatial, np.nan)
+                np.divide(D[wave_index]-model, np.sqrt(V[wave_index]),
+                          out=channel_pull, where=good[wave_index])
+                return channel_pull[good[wave_index]]
+
+            channel_fit = optimize.least_squares(
+                channel_residual, np.clip(initial, lower, upper),
+                bounds=(lower, upper), loss='soft_l1', max_nfev=40)
+            if channel_fit.success:
+                individual_channel_parameters[wave_index] = channel_fit.x
+                individual_channel_cost[wave_index] = channel_fit.cost
+
+    diagnostics = dict(data=D, primary_model=model_primary,
+                       companion_model=model_companion,
+                       background_model=model_background, residual=residual,
+                       mask=output_mask, chi2_reduced=chi2_reduced,
+                       block_parameters=block_parameters,
+                       independent_block_parameters=independent_block_parameters,
+                       polynomial_coefficients=polynomial_coefficients,
+                       polynomial_degree=polynomial_degree,
+                       interpolate_psf=interpolate_psf,
+                       block_centers=block_centers,
+                       individual_channel_parameters=individual_channel_parameters,
+                       individual_channel_cost=individual_channel_cost)
+    return primary, primary_error, companion, companion_error, diagnostics
 
 
 

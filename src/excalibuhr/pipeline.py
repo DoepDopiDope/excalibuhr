@@ -1586,6 +1586,15 @@ class CriresPipeline:
                           extract_2d=True,
                           save_primary=True,
                           extr_level=0.9,
+                          extraction_mode='optimal',
+                          psf_components=2,
+                          psf_block_size=128,
+                          psf_polynomial_degree=None,
+                          interpolate_psf=False,
+                          fit_individual_channels=False,
+                          joint_background='constant',
+                          joint_output_dir=None,
+                          files=None,
                           debug=False):    
         """
         Method for extracting 1D spectrum from the 2D science frames. It works on either 
@@ -1627,6 +1636,18 @@ class CriresPipeline:
             companion extraction to an existing primary time series.
         debug : bool
             generate plots for debugging.
+        extraction_mode: str
+            ``optimal`` preserves the historical extraction. ``joint_psf``
+            simultaneously fits primary and companion with a shared Gaussian
+            mixture PSF.
+        psf_components: int
+            Number of concentric Gaussian components for ``joint_psf``.
+        psf_block_size: int
+            Number of wavelength pixels sharing nonlinear PSF parameters.
+        joint_background: str
+            ``none``, ``constant``, or ``linear`` spatial background.
+        files: sequence of str, optional
+            Restrict processing to these product paths (useful for QA subsets).
 
         See Also
         --------
@@ -1709,13 +1730,21 @@ class CriresPipeline:
                     #         pool_jobs.append(job)
                     # else:
                     for file in self.product_info[indices_wlen][self.key_filename]:
+                        if files is not None and file not in files:
+                            continue
                         job = pool.apply_async(self._process_extraction, 
                                             args=(file, caltype.split('_')[1], 
                                                   bpm, tw, slit, blaze, 
                                                 peak_frac, aper_prim, aper_comp, 
                                                 companion_sep, extract_2d, extr_level,
                                                 remove_star_bkg, remove_sky_bkg,
-                                                savename, save_primary, debug))
+                                                savename, save_primary, debug,
+                                                extraction_mode, psf_components,
+                                                psf_block_size, joint_background,
+                                                psf_polynomial_degree,
+                                                interpolate_psf,
+                                                fit_individual_channels,
+                                                joint_output_dir))
                         pool_jobs.append(job)
             
             for job in pool_jobs:
@@ -1725,7 +1754,13 @@ class CriresPipeline:
                             peak_frac, aper_prim, aper_comp, 
                             companion_sep, extract_2d, extr_level,
                             remove_star_bkg, remove_sky_bkg, 
-                            savename, save_primary, debug):
+                            savename, save_primary, debug,
+                            extraction_mode='optimal', psf_components=2,
+                            psf_block_size=128, joint_background='constant',
+                            psf_polynomial_degree=None,
+                            interpolate_psf=False,
+                            fit_individual_channels=False,
+                            joint_output_dir=None):
         
         with fits.open(os.path.join(self.outpath, file)) as hdu:
             hdr = hdu[0].header
@@ -1739,6 +1774,213 @@ class CriresPipeline:
             f0 = int(peak_frac[pos]*slitlen/self.pix_scale)
         else:
             f0 = None
+
+        if extraction_mode not in ('optimal', 'joint_psf'):
+            raise ValueError("extraction_mode must be 'optimal' or 'joint_psf'")
+        if extraction_mode == 'joint_psf':
+            if companion_sep is None:
+                raise ValueError("joint_psf extraction requires companion_sep")
+            result = self._loop_over_detector(
+                su.extract_joint_spec, False, dt, dt_err, bpm, tw, slit, blaze,
+                self.gain, NDIT=ndit, cen0=f0,
+                companion_sep=companion_sep/self.pix_scale,
+                aper_half=max(aper_prim, aper_comp),
+                psf_components=psf_components, block_size=psf_block_size,
+                polynomial_degree=psf_polynomial_degree,
+                interpolate_psf=interpolate_psf,
+                fit_individual_channels=fit_individual_channels,
+                background=joint_background, debug=debug)
+            flux_pri, err_pri, flux_sec, err_sec, diagnostics = result
+            joint_header = hdr.copy()
+            joint_header['EXTRMODE'] = ('JOINTPSF', 'simultaneous shared-PSF extraction')
+            joint_header['PSFGAUSS'] = (psf_components, 'concentric Gaussian components')
+            joint_header['SEPASEC'] = (companion_sep, 'fixed source separation [arcsec]')
+            joint_header['SEPPIX'] = (companion_sep/self.pix_scale,
+                                      'fixed source separation [pixel]')
+            joint_header['PIXSCALE'] = (self.pix_scale, 'spatial scale [arcsec/pixel]')
+            joint_header['PSFBLKSZ'] = (psf_block_size, 'wavelength pixels per PSF block')
+            joint_header['PSFPOLY'] = (-1 if psf_polynomial_degree is None
+                                       else psf_polynomial_degree,
+                                       'Chebyshev degree; -1 is unregularized')
+            joint_header['PSFINTP'] = (interpolate_psf,
+                                       'interpolate normalized block PSFs')
+            joint_header['BKGDMOD'] = (joint_background, 'simultaneous spatial background')
+            joint_header['ERRMETH'] = ('WLSCOV+CHI2', 'covariance; chi2 inflation if >1')
+            joint_header['BARYCOR'] = (False, 'wavelength correction is a later step')
+            paths = file.split('/')
+            base = paths[-1]
+            label = savename or 'JOINTPSF'
+            if joint_output_dir is not None:
+                output_relative_dir = joint_output_dir.strip('/')
+                os.makedirs(os.path.join(self.outpath, output_relative_dir), exist_ok=True)
+            else:
+                output_relative_dir = '/'.join(paths[:-1])
+            for source, flux, error, caltype_suffix in (
+                    ('PRIMARY', flux_pri, err_pri, 'PRIMARY'),
+                    ('SECONDARY', flux_sec, err_sec, 'SECONDARY')):
+                relative_path = os.path.join(
+                    output_relative_dir, '_'.join(['Extr1D', source, label, base]))
+                filename = os.path.join(self.outpath, relative_path)
+                fits.HDUList([
+                    fits.PrimaryHDU(header=joint_header),
+                    fits.ImageHDU(np.asarray(flux), name='FLUX'),
+                    fits.ImageHDU(np.asarray(error), name='FLUX_ERR'),
+                    fits.ImageHDU(np.isfinite(flux).astype(np.uint8), name='VALID'),
+                ]).writeto(filename, overwrite=True, checksum=True,
+                           output_verify='ignore')
+                self._add_to_product(relative_path,
+                                     f'Extr1D_{filetype}_JOINTPSF_{caltype_suffix}')
+                self._plot_spec_by_order(filename[:-5], flux)
+
+            diagnostic_relative_path = os.path.join(
+                output_relative_dir, '_'.join(['Extr2D', label, base[:-5]])+'.npz')
+            diagnostic_path = os.path.join(self.outpath, diagnostic_relative_path)
+            max_spatial = max(x['data'].shape[1] for detector in diagnostics
+                              for x in detector)
+            sample_count = 16
+            def stack_profile(field):
+                stacked = np.full((len(diagnostics), len(diagnostics[0]), max_spatial),
+                                  np.nan)
+                for detector_index, detector in enumerate(diagnostics):
+                    for order_index, item in enumerate(detector):
+                        values = np.nanmedian(item[field], axis=0)
+                        stacked[detector_index, order_index, :values.size] = values
+                return stacked
+            def stack_cut(field):
+                stacked = np.full((len(diagnostics), len(diagnostics[0]),
+                                   sample_count, max_spatial), np.nan)
+                for detector_index, detector in enumerate(diagnostics):
+                    for order_index, item in enumerate(detector):
+                        indices = np.linspace(0, item[field].shape[0]-1,
+                                              sample_count, dtype=int)
+                        values = item[field][indices]
+                        stacked[detector_index, order_index, :, :values.shape[1]] = values
+                return stacked
+            nblocks = max(len(x['block_parameters']) for detector in diagnostics
+                          for x in detector)
+            block_centroid = np.full((len(diagnostics), len(diagnostics[0]), nblocks), np.nan)
+            block_widths = np.full((len(diagnostics), len(diagnostics[0]),
+                                    nblocks, psf_components), np.nan)
+            block_weights = np.full_like(block_widths, np.nan)
+            for detector_index, detector in enumerate(diagnostics):
+                for order_index, item in enumerate(detector):
+                    for block_index, values in enumerate(item['block_parameters']):
+                        block_centroid[detector_index, order_index, block_index] = values[2]
+                        block_widths[detector_index, order_index, block_index] = values[3]
+                        block_weights[detector_index, order_index, block_index] = values[4]
+            np.savez_compressed(
+                diagnostic_path,
+                profile_data=stack_profile('data'),
+                profile_primary=stack_profile('primary_model'),
+                profile_companion=stack_profile('companion_model'),
+                profile_background=stack_profile('background_model'),
+                profile_residual=stack_profile('residual'),
+                cut_data=stack_cut('data'),
+                cut_primary=stack_cut('primary_model'),
+                cut_companion=stack_cut('companion_model'),
+                cut_background=stack_cut('background_model'),
+                cut_residual=stack_cut('residual'),
+                chi2_reduced=np.asarray([[x['chi2_reduced'] for x in detector]
+                                        for detector in diagnostics]),
+                masked_fraction=np.asarray([[np.mean(x['mask']) for x in detector]
+                                           for detector in diagnostics]),
+                block_centroid=block_centroid,
+                block_widths=block_widths,
+                block_weights=block_weights,
+                independent_block_parameters=np.asarray(
+                    [[x['independent_block_parameters'] for x in detector]
+                     for detector in diagnostics]),
+                polynomial_coefficients=np.asarray(
+                    [[x['polynomial_coefficients'] for x in detector]
+                     for detector in diagnostics]),
+                individual_channel_parameters=np.asarray(
+                    [[x['individual_channel_parameters'] for x in detector]
+                     for detector in diagnostics]),
+                individual_channel_cost=np.asarray(
+                    [[x['individual_channel_cost'] for x in detector]
+                     for detector in diagnostics]),
+                separation_pixels=companion_sep/self.pix_scale,
+                psf_components=psf_components,
+                psf_block_size=psf_block_size,
+                psf_polynomial_degree=(-1 if psf_polynomial_degree is None
+                                       else psf_polynomial_degree),
+                interpolate_psf=interpolate_psf,
+                background=joint_background)
+            self._add_to_product(diagnostic_relative_path,
+                                 f'Extr2D_{filetype}_JOINTPSF')
+            representative = diagnostics[0][len(diagnostics[0])//2]
+            fig, axes = plt.subplots(5, 1, figsize=(8, 10), sharex=True)
+            diagnostic_fields = (
+                ('data', 'Collapsed data'), ('primary_model', 'Primary model'),
+                ('companion_model', 'Companion model'),
+                ('background_model', 'Background'), ('residual', 'Residual'))
+            for axis, (field, title) in zip(axes, diagnostic_fields):
+                axis.plot(np.nanmedian(representative[field], axis=0))
+                axis.set_ylabel(title)
+            axes[-1].set_xlabel('Spatial pixel in joint fitting window')
+            fig.suptitle(f'{base}: detector 1, order {len(diagnostics[0])//2}')
+            fig.tight_layout()
+            fig.savefig(diagnostic_path[:-4]+'.png', dpi=150)
+            plt.close(fig)
+
+            qc_orders = (1, 3, 5)
+            qc_pixels = (410, 1090, 1775)
+            for detector_index, detector in enumerate(diagnostics):
+                fig = plt.figure(figsize=(15, 18))
+                grid = fig.add_gridspec(
+                    6, 3, height_ratios=(3, 1, 3, 1, 3, 1),
+                    hspace=0.32, wspace=0.25)
+                legend_handles, legend_labels = None, None
+                for order_row, order_index in enumerate(qc_orders):
+                    item = detector[order_index]
+                    for column, wave_index in enumerate(qc_pixels):
+                        fit_axis = fig.add_subplot(grid[2*order_row, column])
+                        residual_axis = fig.add_subplot(
+                            grid[2*order_row+1, column], sharex=fit_axis)
+                        observed = item['data'][wave_index]
+                        primary_model = item['primary_model'][wave_index]
+                        companion_model = item['companion_model'][wave_index]
+                        background_model = item['background_model'][wave_index]
+                        total_model = (primary_model+companion_model+
+                                       background_model)
+                        spatial = np.arange(observed.size)
+                        finite = np.isfinite(observed)
+                        fit_axis.plot(spatial[finite], observed[finite], 'o',
+                                      ms=2.5, color='black', label='unbinned data')
+                        fit_axis.plot(spatial, total_model, lw=1.8,
+                                      color='tab:red', label='total model')
+                        fit_axis.plot(spatial, primary_model, lw=1.2,
+                                      color='tab:blue', label='primary')
+                        fit_axis.plot(spatial, companion_model, lw=1.2,
+                                      color='tab:orange', label='companion')
+                        fit_axis.plot(spatial, background_model, lw=1.,
+                                      color='tab:green', label='background')
+                        residual_axis.axhline(0., color='0.5', lw=0.8)
+                        residual_axis.plot(
+                            spatial, item['residual'][wave_index], 'o-',
+                            ms=2., lw=0.7, color='black')
+                        fit_axis.set_title(
+                            f'Order {order_index}, spectral pixel {wave_index}')
+                        fit_axis.set_ylabel('Counts')
+                        residual_axis.set_ylabel('Residual')
+                        residual_axis.set_xlabel('Spatial pixel in fitting window')
+                        fit_axis.tick_params(labelbottom=False)
+                        if legend_handles is None:
+                            legend_handles, legend_labels = (
+                                fit_axis.get_legend_handles_labels())
+                fig.legend(legend_handles, legend_labels,
+                           loc='upper center', ncol=5,
+                           bbox_to_anchor=(0.5, 0.965))
+                fig.suptitle(
+                    f'{base}: detector {detector_index+1}\n'
+                    'Each panel is one unbinned wavelength channel', y=0.995)
+                fig.subplots_adjust(top=0.92)
+                fig.savefig(
+                    diagnostic_path[:-4]+
+                    f'_fullres_detector{detector_index+1}.png',
+                    dpi=180, bbox_inches='tight')
+                plt.close(fig)
+            return
 
         # Extract 1D (and 2D) spectrum of the target
         result = self._loop_over_detector(
