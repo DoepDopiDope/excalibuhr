@@ -2092,17 +2092,28 @@ def PolyfitClip(x, y, order, mask=None, clip=4., max_iter=20):
     x_use = x_mean[mask]
     y_use = np.array(y)[mask]
 
+    coeffs = np.zeros(order)
+    res = np.array([])
+    scatter = np.nan
     for i in range(max_iter):
+        if x_use.size == 0:
+            break
         A_matrix = np.vander(x_use, order)
-        coeffs = np.linalg.solve(np.dot(A_matrix.T, A_matrix), 
-                                 np.dot(A_matrix.T, y_use))
+        # Solving the normal equations can fail for narrow apertures after
+        # masking bad pixels.  Least squares provides the same polynomial
+        # model for full-rank inputs and a stable minimum-norm fallback when
+        # the remaining spatial samples are rank deficient.
+        coeffs = np.linalg.lstsq(A_matrix, y_use, rcond=None)[0]
         y_model = np.dot(A_matrix, coeffs)
         res = (y_use - y_model)
+        scatter = np.std(res)
         # plt.scatter(x_peaks[mask], res)
         # plt.axhline(-sigma*std)
-        if np.any(np.abs(res) > clip*np.std(res)):
-            mask = np.ones_like(x_use, dtype=bool)
-            mask &= (np.abs(res) < clip*np.std(res))
+        if np.isfinite(scatter) and scatter > 0 \
+                and np.any(np.abs(res) > clip*scatter):
+            mask = np.abs(res) < clip*scatter
+            if not np.any(mask):
+                break
         # if np.min(np.abs(res)) < clip*np.std(res):
         #     mask[np.argmax(np.abs(res))] = False
         else:
@@ -2112,7 +2123,10 @@ def PolyfitClip(x, y, order, mask=None, clip=4., max_iter=20):
 
     y_model = np.dot(A_full, coeffs)
     # print(coeffs, i)
-    final_mask = (np.abs(y - y_model) > clip*np.std(res))
+    if np.isfinite(scatter) and scatter > 0:
+        final_mask = np.abs(y - y_model) > clip*scatter
+    else:
+        final_mask = np.zeros_like(y, dtype=bool)
 
     # ite=0
     # while ite < max_iter:
@@ -2778,4 +2792,3 @@ def get_star_properties(obj_name:str):
     return teff, vsini, rv
     
     
-

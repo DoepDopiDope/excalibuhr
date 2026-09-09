@@ -1584,6 +1584,7 @@ class CriresPipeline:
                           remove_sky_bkg=False,
                           aper_prim=20, aper_comp=10, 
                           extract_2d=True,
+                          save_primary=True,
                           extr_level=0.9,
                           debug=False):    
         """
@@ -1620,6 +1621,10 @@ class CriresPipeline:
         extract_2d: bool
             if True, the curvature of the trace in the 2D images will be corrected and 
             the intermediate 2D data will be saved to .npz files. 
+        save_primary: bool
+            if False, use the primary internally to locate the companion but do not
+            rewrite primary extraction products. This is useful when adding a
+            companion extraction to an existing primary time series.
         debug : bool
             generate plots for debugging.
 
@@ -1710,7 +1715,7 @@ class CriresPipeline:
                                                 peak_frac, aper_prim, aper_comp, 
                                                 companion_sep, extract_2d, extr_level,
                                                 remove_star_bkg, remove_sky_bkg,
-                                                savename, debug))
+                                                savename, save_primary, debug))
                         pool_jobs.append(job)
             
             for job in pool_jobs:
@@ -1720,7 +1725,7 @@ class CriresPipeline:
                             peak_frac, aper_prim, aper_comp, 
                             companion_sep, extract_2d, extr_level,
                             remove_star_bkg, remove_sky_bkg, 
-                            savename, debug):
+                            savename, save_primary, debug):
         
         with fits.open(os.path.join(self.outpath, file)) as hdu:
             hdr = hdu[0].header
@@ -1751,29 +1756,30 @@ class CriresPipeline:
         # snr_mid = np.nanmean(np.array(flux_pri)[:, mid_order ,:])
         snr_mid = np.nanmean(np.array(flux_pri)[:, mid_order ,:]/np.array(err_pri)[:, mid_order ,:]).astype(int)
 
-        paths = file.split('/')
-        paths[-1] = '_'.join(['Extr1D_PRIMARY', savename, paths[-1]])
-        filename = os.path.join(self.outpath, '/'.join(paths))
-        wfits(filename, ext_list={"FLUX": flux_pri, "FLUX_ERR": err_pri}, header=hdr)
-        if savename == '':
-            self._add_to_product('/'.join(paths), f'Extr1D_{filetype}_PRIMARY', snr_mid)
-        else:
-            self._add_to_product('/'.join(paths), '_'.join(['Extr1D', filetype, savename]), snr_mid)
-        self._plot_spec_by_order(filename[:-5], flux_pri)
-        
-        if extract_2d:
+        if save_primary:
             paths = file.split('/')
-            paths[-1] =  '_'.join(['Extr2D_PRIMARY', savename, paths[-1][:-5]])
-            filename2d = os.path.join(self.outpath, '/'.join(paths))
-
-            extr2d = DETECTOR(data=[D, V, P], fields=['flux', 'var', 'psf'])
-            extr2d.save_extr2d(filename2d)
-            extr2d.plot_extr2d_model(filename2d)
-
+            paths[-1] = '_'.join(['Extr1D_PRIMARY', savename, paths[-1]])
+            filename = os.path.join(self.outpath, '/'.join(paths))
+            wfits(filename, ext_list={"FLUX": flux_pri, "FLUX_ERR": err_pri}, header=hdr)
             if savename == '':
-                self._add_to_product('/'.join(paths)+'.npz', f'Extr2D_{filetype}_PRIMARY')
+                self._add_to_product('/'.join(paths), f'Extr1D_{filetype}_PRIMARY', snr_mid)
             else:
-                self._add_to_product('/'.join(paths)+'.npz', '_'.join(['Extr2D', filetype, savename]))
+                self._add_to_product('/'.join(paths), '_'.join(['Extr1D', filetype, savename]), snr_mid)
+            self._plot_spec_by_order(filename[:-5], flux_pri)
+
+            if extract_2d:
+                paths = file.split('/')
+                paths[-1] =  '_'.join(['Extr2D_PRIMARY', savename, paths[-1][:-5]])
+                filename2d = os.path.join(self.outpath, '/'.join(paths))
+
+                extr2d = DETECTOR(data=[D, V, P], fields=['flux', 'var', 'psf'])
+                extr2d.save_extr2d(filename2d)
+                extr2d.plot_extr2d_model(filename2d)
+
+                if savename == '':
+                    self._add_to_product('/'.join(paths)+'.npz', f'Extr2D_{filetype}_PRIMARY')
+                else:
+                    self._add_to_product('/'.join(paths)+'.npz', '_'.join(['Extr2D', filetype, savename]))
 
         if not companion_sep is None:
 
@@ -1911,6 +1917,158 @@ class CriresPipeline:
 
                 self._plot_spec_by_order(file_name[:-5], dt, wlen_cal, 
                                         transm_spec=tellu_conv)
+
+
+    @print_runtime
+    def refine_wlen_solution_per_frame(self, debug=False):
+        """Refine and save a telluric wavelength solution per exposure.
+
+        The wavelength correction is measured from each extracted primary
+        ``Extr1D_FRAME_PRIMARY`` spectrum.  The resulting solution applies to
+        every source recorded simultaneously in that exposure, including a
+        companion.  A CSV table and diagnostic plot summarize the wavelength
+        drift as a function of time.
+
+        Parameters
+        ----------
+        debug : bool
+            Forward diagnostic plotting to :func:`excalibuhr.utils.wlen_solution`.
+
+        Returns
+        -------
+        pandas.DataFrame
+            One row per exposure, detector, and spectral order.
+        """
+
+        self._print_section("Refine wavelength solution per exposure")
+        self.product_info = pd.read_csv(self.product_file, sep=';')
+        indices = self.product_info[self.key_caltype] == 'Extr1D_FRAME_PRIMARY'
+        frame_info = self.product_info[indices].copy()
+        if frame_info.empty:
+            raise RuntimeError(
+                "No Extr1D_FRAME_PRIMARY spectra found. Run obs_extract("
+                "caltype='NOD_FRAME', extract_2d=False) first."
+            )
+        frame_info = frame_info.sort_values(self.key_mjd)
+
+        telluric_file = os.path.join(self.calpath, "TRANSM_SPEC.fits")
+        if not os.path.isfile(telluric_file):
+            self.run_skycalc(airmass=frame_info[self.key_airmass].median())
+        telluric = fits.getdata(telluric_file)
+
+        wlen_id = frame_info[self.key_wlen].iloc[0]
+        initial_index = (self.calib_info[self.key_caltype] == "INIT_WLEN") \
+                      & (self.calib_info[self.key_wlen] == wlen_id)
+        initial_file = self.calib_info[initial_index][self.key_filename].iloc[0]
+        initial_wlen = fits.getdata(os.path.join(self.calpath, initial_file))
+
+        slit_width = frame_info[self.key_slitwid].iloc[0]
+        if slit_width == "w_0.2":
+            spectral_resolution = 100000.0
+        elif slit_width == "w_0.4":
+            spectral_resolution = 50000.0
+        else:
+            raise ValueError(f"Unsupported slit width: {slit_width}")
+        telluric_conv = su.SpecConvolve(
+            telluric[:, 0], telluric[:, 1],
+            out_res=spectral_resolution, in_res=2e5,
+        )
+        telluric_conv = np.column_stack((telluric[:, 0], telluric_conv))
+
+        def correlation(flux, wave):
+            finite = np.isfinite(flux) & np.isfinite(wave)
+            if np.count_nonzero(finite) < 11:
+                return np.nan
+            observed = flux[finite]
+            model = np.interp(wave[finite], telluric_conv[:, 0],
+                              telluric_conv[:, 1])
+            observed = observed - np.nanmedian(observed)
+            model = model - np.nanmedian(model)
+            norm = np.sqrt(np.sum(observed**2) * np.sum(model**2))
+            return np.sum(observed * model) / norm if norm > 0 else np.nan
+
+        rows = []
+        first_mjd = frame_info[self.key_mjd].iloc[0]
+        speed_of_light = 299792458.0
+        for _, frame in frame_info.iterrows():
+            product_file = os.path.join(self.outpath, frame[self.key_filename])
+            with fits.open(product_file) as hdus:
+                header = hdus[0].header
+                flux = hdus["FLUX"].data
+                flux_err = hdus["FLUX_ERR"].data
+
+            calibrated_wlen = np.asarray(self._loop_over_detector(
+                su.wlen_solution, False, flux, flux_err, initial_wlen,
+                transm_spec=telluric_conv, debug=debug,
+            ))
+            exposure_id = Path(header[self.key_filename]).stem
+            output_name = f"WLEN_FRAME_{exposure_id}.fits"
+            wfits(os.path.join(self.calpath, output_name),
+                  ext_list={"WAVE": calibrated_wlen}, header=header)
+
+            for detector in range(calibrated_wlen.shape[0]):
+                for order in range(calibrated_wlen.shape[1]):
+                    wave0 = initial_wlen[detector, order].astype(float)
+                    wave1 = calibrated_wlen[detector, order].astype(float)
+                    center = np.nanmean(wave0)
+                    coefficients = Poly.polyfit(
+                        wave0 - center, wave1 - wave0, 2,
+                    )
+                    velocity = speed_of_light * (wave1 - wave0) / wave0
+                    rows.append({
+                        "filename": frame[self.key_filename],
+                        "origfile": header.get(self.key_filename),
+                        "mjd": frame[self.key_mjd],
+                        "time_hours": 24.0 * (frame[self.key_mjd] - first_mjd),
+                        "nodpos": frame[self.key_nodpos],
+                        "detector": detector + 1,
+                        "order": order,
+                        "wavelength_mid_nm": center,
+                        "poly_p0_nm": coefficients[0],
+                        "poly_p1": coefficients[1],
+                        "poly_p2_per_nm": coefficients[2],
+                        "velocity_shift_mps": np.nanmedian(velocity),
+                        "velocity_span_mps": np.nanmax(velocity) - np.nanmin(velocity),
+                        "correlation_initial": correlation(
+                            flux[detector, order], wave0,
+                        ),
+                        "correlation_refined": correlation(
+                            flux[detector, order], wave1,
+                        ),
+                        "wavelength_file": output_name,
+                    })
+
+        summary = pd.DataFrame(rows)
+        summary["relative_shift_mps"] = summary.groupby(
+            ["nodpos", "detector", "order"], sort=False
+        )["velocity_shift_mps"].transform(lambda values: values - values.iloc[0])
+        summary_file = os.path.join(self.calpath, "WLEN_FRAME_SUMMARY.csv")
+        summary.to_csv(summary_file, index=False)
+
+        grouped = summary.groupby(["filename", "mjd", "time_hours", "nodpos"])
+        drift = grouped[["velocity_shift_mps", "relative_shift_mps"]].median().reset_index()
+        fig, axes = plt.subplots(2, 1, figsize=(8, 7), sharex=True)
+        for nodpos, marker in (("A", "o"), ("B", "s")):
+            selected = drift[drift["nodpos"] == nodpos]
+            axes[0].plot(selected["time_hours"], selected["velocity_shift_mps"],
+                         marker=marker, linestyle='none', label=f"Nod {nodpos}")
+            axes[1].plot(selected["time_hours"], selected["relative_shift_mps"],
+                         marker=marker, linestyle='none', label=f"Nod {nodpos}")
+        for ax in axes:
+            ax.axhline(0.0, color='0.6', linewidth=1)
+            ax.legend()
+        axes[0].set_ylabel("Correction from initial solution (m/s)")
+        axes[1].set(
+            xlabel="Time since first exposure (hours)",
+            ylabel="Change from first exposure of each nod (m/s)",
+        )
+        fig.tight_layout()
+        fig.savefig(os.path.join(self.calpath, "WLEN_FRAME_DRIFT.png"), dpi=180)
+        plt.close(fig)
+
+        print(f"Saved {len(frame_info)} per-exposure wavelength solutions")
+        print(f"Summary: {summary_file}")
+        return summary
 
 
     @print_runtime
@@ -2567,4 +2725,3 @@ class CriresPipeline:
 
         if combine:
             self.obs_nodding_combine(combine_mode=combine_mode)
-
