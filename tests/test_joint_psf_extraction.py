@@ -1,7 +1,8 @@
 import numpy as np
 import unittest
 
-from excalibuhr.utils import gaussian_mixture_psf, joint_psf_extraction
+from excalibuhr.utils import (empirical_joint_psf_extraction,
+                              gaussian_mixture_psf, joint_psf_extraction)
 
 
 class JointPsfExtractionTest(unittest.TestCase):
@@ -117,6 +118,60 @@ class JointPsfExtractionTest(unittest.TestCase):
     self.assertLess(abs(np.nanmedian(
         (result[2]-companion_true)/companion_true)), 0.10)
     self.assertTrue(result[4]["interpolate_psf"])
+
+  def test_empirical_asymmetric_psf_with_bad_pixels(self):
+    rng = np.random.default_rng(20260909)
+    nwave, nspatial = 192, 61
+    spatial = np.arange(nspatial, dtype=float)
+    centroid = 36.2
+    separation = 12.875
+    primary_true = 9.e4*(1.+0.04*np.sin(np.linspace(0, 5, nwave)))
+    companion_true = 1350.*(1.+0.08*np.cos(np.linspace(0, 7, nwave)))
+    data = np.empty((nwave, nspatial))
+    true_profiles = []
+    for channel, coordinate in enumerate(np.linspace(-1., 1., nwave)):
+      core = np.exp(-0.5*((spatial-(centroid+0.18*coordinate))/1.25)**2)
+      red_wing = 0.16*np.exp(-0.5*((spatial-(centroid+3.1))/3.4)**2)
+      blue_tail = 0.055*np.exp(-np.clip(
+          (centroid-1.5-spatial)/4.5, 0., None))*(spatial < centroid-1.5)
+      profile = np.clip(core+red_wing+blue_tail, 0., None)
+      profile /= profile.sum()
+      shifted = np.interp(spatial+separation, spatial, profile,
+                          left=0., right=0.)
+      shifted /= shifted.sum()
+      true_profiles.append(profile)
+      data[channel] = (primary_true[channel]*profile+
+                       companion_true[channel]*shifted+28.)
+    variance = np.full_like(data, 32.**2)
+    data += rng.normal(scale=np.sqrt(variance))
+    bad = rng.random(data.shape) < 0.04
+    data[71, 19] += 4000.
+    result = empirical_joint_psf_extraction(
+        data, variance, bad, obj_cen=36., companion_sep=separation,
+        block_size=32, spatial_lambda=0.2, wavelength_lambda=3.,
+        protection_radius=3.5, derivative_smoothing_sigma=0.4,
+        max_iterations=20,
+        convergence_tolerance=3.e-3)
+    primary, primary_error, companion, companion_error, diagnostic = result
+    self.assertLess(abs(np.nanmedian((primary-primary_true)/primary_true)), 0.15)
+    self.assertLess(abs(np.nanmedian(
+        (companion-companion_true)/companion_true)), 0.18)
+    self.assertTrue(np.all(diagnostic["empirical_profiles"] >= 0.))
+    np.testing.assert_allclose(diagnostic["empirical_profiles"].sum(axis=1), 1.)
+    self.assertTrue(np.all(np.isfinite(primary_error)))
+    self.assertTrue(np.all(np.isfinite(companion_error)))
+    self.assertTrue(diagnostic["mask"][71, 19])
+    self.assertLessEqual(diagnostic["iterations"], 20)
+    self.assertEqual(diagnostic["separation_pixels"], separation)
+    self.assertEqual(diagnostic["block_centroids"].shape, (nwave//32,))
+    self.assertTrue(np.all(np.isfinite(diagnostic["centroid_history"])))
+
+  def test_empirical_configuration_is_strict(self):
+    arrays = np.ones((64, 40))
+    with self.assertRaises(ValueError):
+      empirical_joint_psf_extraction(
+          arrays, arrays, np.zeros_like(arrays, dtype=bool), 25.,
+          block_size=16)
 
 
 if __name__ == "__main__":

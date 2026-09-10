@@ -1578,7 +1578,14 @@ def extract_joint_spec(det, det_err, badpix, trace, slit, blaze, gain, NDIT=1,
                        polynomial_degree=None,
                        interpolate_psf=False,
                        fit_individual_channels=False,
-                       background='constant', badpix_clip=5., debug=False):
+                       background='constant', badpix_clip=5., debug=False,
+                       empirical=False, empirical_spatial_lambda=0.2,
+                       empirical_wavelength_lambda=5.,
+                       empirical_protection_radius=4.,
+                       empirical_derivative_smoothing_sigma=0.,
+                       empirical_wing_zero_width=2,
+                       empirical_max_iterations=25,
+                       empirical_convergence_tolerance=1.e-3):
     """Extract primary and companion simultaneously with one shared PSF."""
     im, im_err = spectral_rectify_interp(
         [det, det_err], badpix, trace, slit, debug=False)
@@ -1605,14 +1612,27 @@ def extract_joint_spec(det, det_err, badpix, trace, slit, blaze, gain, NDIT=1,
         data = image[lo:hi].T
         variance = error[lo:hi].T**2
         mask = bpm[lo:hi].T | ~np.isfinite(data) | ~np.isfinite(variance)
-        result = joint_psf_extraction(
-            data, variance, mask, obj_cen=center-lo,
-            companion_sep=companion_sep, psf_components=psf_components,
-            block_size=block_size, polynomial_degree=polynomial_degree,
-            interpolate_psf=interpolate_psf,
-            fit_individual_channels=fit_individual_channels,
-            background=background,
-            badpix_clip=badpix_clip)
+        if empirical:
+            result = empirical_joint_psf_extraction(
+                data, variance, mask, obj_cen=center-lo,
+                companion_sep=companion_sep, block_size=block_size,
+                background=background, badpix_clip=badpix_clip,
+                spatial_lambda=empirical_spatial_lambda,
+                wavelength_lambda=empirical_wavelength_lambda,
+                protection_radius=empirical_protection_radius,
+                derivative_smoothing_sigma=empirical_derivative_smoothing_sigma,
+                wing_zero_width=empirical_wing_zero_width,
+                max_iterations=empirical_max_iterations,
+                convergence_tolerance=empirical_convergence_tolerance)
+        else:
+            result = joint_psf_extraction(
+                data, variance, mask, obj_cen=center-lo,
+                companion_sep=companion_sep, psf_components=psf_components,
+                block_size=block_size, polynomial_degree=polynomial_degree,
+                interpolate_psf=interpolate_psf,
+                fit_individual_channels=fit_individual_channels,
+                background=background,
+                badpix_clip=badpix_clip)
         f_primary, e_primary, f_companion, e_companion, diag = result
         primary.append(f_primary/blaze[order])
         primary_error.append(e_primary/blaze[order])
@@ -1921,6 +1941,333 @@ def _weighted_linear_model(data, variance, mask, design):
     if np.isfinite(chi2_reduced) and chi2_reduced > 1:
         covariance *= chi2_reduced
     return coefficients, covariance, model, chi2_reduced
+
+
+def _shift_normalized_profile(profile, shift):
+    """Shift a sampled profile by ``shift`` pixels and preserve unit flux."""
+    profile = np.asarray(profile, dtype=float)
+    shifted = ndimage.shift(profile, shift, order=3, mode='constant', cval=0.,
+                            prefilter=True)
+    shifted = np.clip(shifted, 0., None)
+    total = shifted.sum()
+    return shifted/total if total > 0 else shifted
+
+
+def _empirical_profile_centroid(profile, reference, half_width=5.):
+    """Robust subpixel centroid from the bright primary core."""
+    profile = np.asarray(profile, dtype=float)
+    pixels = np.arange(profile.size, dtype=float)
+    core = (np.abs(pixels-reference) <= half_width) & np.isfinite(profile)
+    if np.count_nonzero(core) < 3:
+        return float(reference)
+    values = np.clip(profile[core]-np.nanmin(profile[core]), 0., None)
+    if values.sum() <= 0:
+        return float(reference)
+    centroid = np.sum(pixels[core]*values)/values.sum()
+    return float(np.clip(centroid, reference-half_width, reference+half_width))
+
+
+def _smooth_block_centroids(centroids, wavelength_lambda):
+    """Regularize centroid motion independently of PSF-shape evolution."""
+    centroids = np.asarray(centroids, dtype=float)
+    if centroids.size <= 2 or wavelength_lambda <= 0:
+        return centroids
+    d2 = np.diff(np.eye(centroids.size), n=2, axis=0)
+    return np.linalg.solve(
+        np.eye(centroids.size)+wavelength_lambda*(d2.T @ d2), centroids)
+
+
+def _regularize_empirical_profiles(raw, weights, spatial_lambda,
+                                   wavelength_lambda, smooth_sigma=0.7,
+                                   wing_zero_width=4):
+    """Fit positive profiles with smooth values and smooth derivatives."""
+    raw = np.asarray(raw, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    nblock, nspatial = raw.shape
+    d2_spatial = np.diff(np.eye(nspatial), n=2, axis=0)
+    spatial_penalty = spatial_lambda*(d2_spatial.T @ d2_spatial)
+    smoothed = np.empty_like(raw)
+    for block in range(nblock):
+        matrix = np.diag(weights[block])+spatial_penalty
+        rhs = weights[block]*np.nan_to_num(raw[block], nan=0.)
+        smoothed[block] = np.linalg.lstsq(matrix, rhs, rcond=None)[0]
+    if nblock > 2 and wavelength_lambda > 0:
+        d2_wave = np.diff(np.eye(nblock), n=2, axis=0)
+        wave_matrix = np.eye(nblock)+wavelength_lambda*(d2_wave.T @ d2_wave)
+        smoothed = np.column_stack([
+            np.linalg.solve(wave_matrix, smoothed[:, pixel])
+            for pixel in range(nspatial)])
+    if smooth_sigma > 0:
+        smoothed = ndimage.gaussian_filter1d(
+            smoothed, smooth_sigma, axis=1, mode='nearest')
+    if wing_zero_width > 0:
+        edge = min(int(wing_zero_width), max(nspatial//4, 1))
+        coordinate = np.linspace(0., 1., nspatial)
+        for block in range(nblock):
+            left = max(float(np.nanmedian(smoothed[block, :edge])), 0.)
+            right = max(float(np.nanmedian(smoothed[block, -edge:])), 0.)
+            smoothed[block] -= left+(right-left)*coordinate
+        taper = np.ones(nspatial)
+        phase = np.linspace(0., np.pi/2., edge+1)[1:]
+        taper[:edge] = np.sin(phase)**2
+        taper[-edge:] = taper[:edge][::-1]
+        smoothed *= taper[None, :]
+    smoothed = np.clip(smoothed, 0., None)
+    totals = smoothed.sum(axis=1)
+    invalid = ~np.isfinite(totals) | (totals <= 0)
+    if np.any(invalid):
+        raise RuntimeError("empirical PSF regularization produced an empty profile")
+    return smoothed/totals[:, None]
+
+
+def empirical_joint_psf_extraction(
+        D_full, V_full, bpm_full, obj_cen, companion_sep=12.875,
+        block_size=32, background='constant', badpix_clip=5.,
+        spatial_lambda=0.2, wavelength_lambda=5., protection_radius=4.,
+        derivative_smoothing_sigma=0.,
+        wing_zero_width=2,
+        max_iterations=25, convergence_tolerance=1.e-3,
+        convergence_patience=2):
+    """Joint extraction with a positive wavelength-regularized empirical PSF.
+
+    A unit-sum profile is estimated on the native spatial grid in each
+    wavelength block.  The companion always uses the identical profile shifted
+    by exactly ``-companion_sep`` pixels.  The protected companion aperture is
+    omitted only while updating the primary-derived profile; it remains in the
+    per-channel primary/companion/background amplitude fits.
+    """
+    D = np.asarray(D_full, dtype=float)
+    V = np.asarray(V_full, dtype=float)
+    bad = np.asarray(bpm_full, dtype=bool)
+    if D.shape != V.shape or D.shape != bad.shape or D.ndim != 2:
+        raise ValueError("data, variance, and mask must share shape (wavelength, spatial)")
+    if block_size != 32:
+        raise ValueError("empirical shared-PSF extraction requires 32-channel blocks")
+    if background not in ('none', 'constant'):
+        raise ValueError("empirical background must be 'none' or 'constant'")
+    if spatial_lambda < 0 or wavelength_lambda < 0:
+        raise ValueError("regularization strengths must be non-negative")
+    if (protection_radius <= 0 or derivative_smoothing_sigma < 0 or
+            wing_zero_width < 1 or max_iterations < 1):
+        raise ValueError("protection_radius and max_iterations must be positive")
+
+    nwave, nspatial = D.shape
+    spatial = np.arange(nspatial, dtype=float)
+    good = (~bad) & np.isfinite(D) & np.isfinite(V) & (V > 0)
+    starts = np.arange(0, nwave, block_size)
+    stops = np.minimum(starts+block_size, nwave)
+    centers = 0.5*(starts+stops-1)
+    nblock = len(starts)
+    companion_center = float(obj_cen)-float(companion_sep)
+    protected = np.abs(spatial-companion_center) <= protection_radius
+    bg_columns = [np.ones(nspatial)] if background == 'constant' else []
+    measured_channel_centroids = np.asarray([
+        _empirical_profile_centroid(
+            np.where(good[wave], D[wave], np.nan), obj_cen)
+        for wave in range(nwave)])
+    channel_centroids = ndimage.median_filter(
+        measured_channel_centroids, size=9, mode='nearest')
+    if nwave >= 65:
+        channel_centroids = signal.savgol_filter(
+            channel_centroids, 65, 2, mode='interp')
+    channel_centroids = np.clip(channel_centroids, obj_cen-4., obj_cen+4.)
+
+    # Primary-dominated initialization.  The protected interval is filled only
+    # by interpolation from its boundaries and subsequent smoothness penalties.
+    raw_nodes = np.zeros((nblock, nspatial))
+    raw_weights = np.zeros_like(raw_nodes)
+    for block, (start, stop) in enumerate(zip(starts, stops)):
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            collapsed = np.nanmedian(np.where(good[start:stop], D[start:stop], np.nan), axis=0)
+            collapsed_var = np.nanmedian(np.where(good[start:stop], V[start:stop], np.nan), axis=0)
+        valid = np.isfinite(collapsed) & np.isfinite(collapsed_var) & (collapsed_var > 0)
+        edge = valid & (np.abs(spatial-obj_cen) > 18.) & ~protected
+        bg = np.nanmedian(collapsed[edge]) if background == 'constant' and np.any(edge) else 0.
+        raw = np.clip(collapsed-bg, 0., None)
+        usable = valid & ~protected
+        if np.count_nonzero(usable) < 5:
+            raise RuntimeError("too few primary-dominated pixels to initialize empirical PSF")
+        raw[protected] = np.interp(spatial[protected], spatial[usable], raw[usable])
+        raw_nodes[block] = raw
+        raw_weights[block, usable] = 1./collapsed_var[usable]
+        scale = np.nanmedian(raw_weights[block, usable])
+        raw_weights[block] /= scale if np.isfinite(scale) and scale > 0 else 1.
+        raw_weights[block, protected] = 0.
+    block_centroids = np.asarray([
+        np.nanmedian(channel_centroids[start:stop])
+        for start, stop in zip(starts, stops)])
+    block_centroids = _smooth_block_centroids(block_centroids, wavelength_lambda)
+    registered_raw = np.asarray([
+        ndimage.shift(raw_nodes[block], obj_cen-block_centroids[block],
+                      order=3, mode='constant', cval=0., prefilter=True)
+        for block in range(nblock)])
+    registered_weight = np.asarray([
+        ndimage.shift(raw_weights[block], obj_cen-block_centroids[block],
+                      order=1, mode='constant', cval=0., prefilter=False)
+        for block in range(nblock)])
+    nodes = _regularize_empirical_profiles(
+        registered_raw, registered_weight, spatial_lambda, wavelength_lambda,
+        derivative_smoothing_sigma, wing_zero_width)
+
+    pixels = np.arange(nwave, dtype=float)
+    primary = np.full(nwave, np.nan)
+    companion = np.full(nwave, np.nan)
+    primary_error = np.full(nwave, np.nan)
+    companion_error = np.full(nwave, np.nan)
+    chi2_reduced = np.full(nwave, np.nan)
+    model_primary = np.full_like(D, np.nan)
+    model_companion = np.full_like(D, np.nan)
+    model_background = np.full_like(D, np.nan)
+    residual = np.full_like(D, np.nan)
+    output_mask = ~good.copy()
+    initial_absolute_nodes = np.asarray([
+        _shift_normalized_profile(nodes[block], block_centroids[block]-obj_cen)
+        for block in range(nblock)])
+    profile_history, profile_change_history = [initial_absolute_nodes], []
+    centroid_history = [block_centroids.copy()]
+    companion_change_history = []
+    previous_companion = None
+    stable_iterations = 0
+    converged = False
+    effective_badpix_clip = (max(float(badpix_clip), 10.)
+                             if badpix_clip is not None else None)
+
+    for iteration in range(max_iterations):
+        fitted_nodes = np.asarray([
+            _shift_normalized_profile(nodes[block], block_centroids[block]-obj_cen)
+            for block in range(nblock)])
+        profiles = np.column_stack([
+            np.interp(pixels, centers, fitted_nodes[:, position])
+            for position in range(nspatial)])
+        profiles = np.clip(profiles, 0., None)
+        profiles /= profiles.sum(axis=1)[:, None]
+        interpolated_centroids = np.interp(pixels, centers, block_centroids)
+        profiles = np.asarray([
+            _shift_normalized_profile(
+                profiles[wave], channel_centroids[wave]-interpolated_centroids[wave])
+            for wave in range(nwave)])
+        companion_profiles = np.asarray([
+            _shift_normalized_profile(profile, -companion_sep)
+            for profile in profiles])
+        for wave in range(nwave):
+            design = np.column_stack(
+                [profiles[wave], companion_profiles[wave]]+bg_columns)
+            mask = good[wave].copy()
+            coefficients, covariance, model, reduced = _weighted_linear_model(
+                D[wave], V[wave], mask, design)
+            if (np.all(np.isfinite(coefficients)) and
+                    effective_badpix_clip is not None and iteration >= 5):
+                pull = np.full(nspatial, np.nan)
+                np.divide(np.abs(D[wave]-model), np.sqrt(V[wave]), out=pull,
+                          where=np.isfinite(V[wave]) & (V[wave] > 0))
+                mask &= ~(np.isfinite(pull) & (pull > effective_badpix_clip))
+                coefficients, covariance, model, reduced = _weighted_linear_model(
+                    D[wave], V[wave], mask, design)
+            if not np.all(np.isfinite(coefficients[:2])):
+                continue
+            primary[wave], companion[wave] = coefficients[:2]
+            primary_error[wave] = np.sqrt(max(covariance[0, 0], 0.))
+            companion_error[wave] = np.sqrt(max(covariance[1, 1], 0.))
+            model_primary[wave] = coefficients[0]*profiles[wave]
+            model_companion[wave] = coefficients[1]*companion_profiles[wave]
+            model_background[wave] = (design[:, 2:] @ coefficients[2:]
+                                      if bg_columns else 0.)
+            residual[wave] = D[wave]-model
+            output_mask[wave] = ~mask
+            chi2_reduced[wave] = reduced
+
+        updated_raw = np.zeros_like(nodes)
+        updated_weight = np.zeros_like(nodes)
+        for block, (start, stop) in enumerate(zip(starts, stops)):
+            for position in range(nspatial):
+                channels = (good[start:stop, position] &
+                            np.isfinite(primary[start:stop]) &
+                            (primary[start:stop] > 0))
+                if not np.any(channels):
+                    continue
+                numerator = (D[start:stop, position]-
+                             model_companion[start:stop, position]-
+                             model_background[start:stop, position])
+                samples = numerator/primary[start:stop]
+                sample_variance = V[start:stop, position]/primary[start:stop]**2
+                weights = np.where(channels, 1./sample_variance, 0.)
+                finite = channels & np.isfinite(samples) & np.isfinite(weights)
+                if np.any(finite) and weights[finite].sum() > 0:
+                    updated_raw[block, position] = np.nanmedian(samples[finite])
+                    updated_weight[block, position] = weights[finite].sum()
+                    if protected[position]:
+                        updated_weight[block, position] *= 0.05
+            usable = updated_weight[block] > 0
+            if np.count_nonzero(usable) < 5:
+                updated_raw[block] = fitted_nodes[block]
+                updated_weight[block] = 1.
+                updated_weight[block, protected] = 0.
+            else:
+                scale = np.nanmedian(updated_weight[block, usable])
+                updated_weight[block] /= scale if scale > 0 else 1.
+        registered_raw = np.asarray([
+            ndimage.shift(updated_raw[block], obj_cen-block_centroids[block],
+                          order=3, mode='constant', cval=0., prefilter=True)
+            for block in range(nblock)])
+        registered_weight = np.asarray([
+            ndimage.shift(updated_weight[block], obj_cen-block_centroids[block],
+                          order=1, mode='constant', cval=0., prefilter=False)
+            for block in range(nblock)])
+        proposed_nodes = _regularize_empirical_profiles(
+            registered_raw, registered_weight, spatial_lambda, wavelength_lambda,
+            derivative_smoothing_sigma, wing_zero_width)
+        updated_nodes = 0.7*nodes+0.3*proposed_nodes
+        updated_nodes /= updated_nodes.sum(axis=1)[:, None]
+        updated_absolute_nodes = np.asarray([
+            _shift_normalized_profile(
+                updated_nodes[block], block_centroids[block]-obj_cen)
+            for block in range(nblock)])
+        profile_change = np.max(np.sum(
+            np.abs(updated_absolute_nodes-fitted_nodes), axis=1))
+        if previous_companion is None:
+            companion_change = np.inf
+        else:
+            valid = (np.isfinite(companion) & np.isfinite(previous_companion))
+            scale = max(abs(np.nanmedian(previous_companion[valid])), 1.e-12)
+            companion_change = (abs(np.nanmedian(companion[valid]-previous_companion[valid]))/
+                                scale) if np.any(valid) else np.inf
+        profile_change_history.append(profile_change)
+        companion_change_history.append(companion_change)
+        previous_companion = companion.copy()
+        nodes = updated_nodes
+        profile_history.append(updated_absolute_nodes)
+        centroid_history.append(block_centroids.copy())
+        if profile_change < convergence_tolerance and companion_change < convergence_tolerance:
+            stable_iterations += 1
+        else:
+            stable_iterations = 0
+        if stable_iterations >= convergence_patience:
+            converged = True
+            break
+
+    diagnostics = dict(
+        data=D, primary_model=model_primary, companion_model=model_companion,
+        background_model=model_background, residual=residual, mask=output_mask,
+        chi2_reduced=chi2_reduced, block_centers=centers,
+        empirical_profiles=fitted_nodes,
+        empirical_profile_history=np.asarray(profile_history),
+        block_centroids=block_centroids,
+        channel_centroids=channel_centroids,
+        centroid_history=np.asarray(centroid_history),
+        profile_change_history=np.asarray(profile_change_history),
+        companion_change_history=np.asarray(companion_change_history),
+        iterations=iteration+1, converged=converged,
+        spatial_lambda=spatial_lambda, wavelength_lambda=wavelength_lambda,
+        derivative_smoothing_sigma=derivative_smoothing_sigma,
+        wing_zero_width=wing_zero_width,
+        badpix_clip=effective_badpix_clip,
+        protection_radius=protection_radius,
+        convergence_tolerance=convergence_tolerance,
+        convergence_patience=convergence_patience,
+        max_iterations=max_iterations, companion_center=companion_center,
+        separation_pixels=companion_sep, background=background)
+    return primary, primary_error, companion, companion_error, diagnostics
 
 
 def joint_psf_extraction(D_full, V_full, bpm_full, obj_cen,

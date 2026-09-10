@@ -1594,6 +1594,13 @@ class CriresPipeline:
                           fit_individual_channels=False,
                           joint_background='constant',
                           joint_output_dir=None,
+                          empirical_spatial_lambda=0.2,
+                          empirical_wavelength_lambda=5.,
+                          empirical_protection_radius=4.,
+                          empirical_derivative_smoothing_sigma=0.,
+                          empirical_wing_zero_width=2,
+                          empirical_max_iterations=25,
+                          empirical_convergence_tolerance=1.e-3,
                           files=None,
                           debug=False):    
         """
@@ -1744,7 +1751,14 @@ class CriresPipeline:
                                                 psf_polynomial_degree,
                                                 interpolate_psf,
                                                 fit_individual_channels,
-                                                joint_output_dir))
+                                                joint_output_dir,
+                                                empirical_spatial_lambda,
+                                                empirical_wavelength_lambda,
+                                                empirical_protection_radius,
+                                                empirical_derivative_smoothing_sigma,
+                                                empirical_wing_zero_width,
+                                                empirical_max_iterations,
+                                                empirical_convergence_tolerance))
                         pool_jobs.append(job)
             
             for job in pool_jobs:
@@ -1760,7 +1774,14 @@ class CriresPipeline:
                             psf_polynomial_degree=None,
                             interpolate_psf=False,
                             fit_individual_channels=False,
-                            joint_output_dir=None):
+                            joint_output_dir=None,
+                            empirical_spatial_lambda=0.2,
+                            empirical_wavelength_lambda=5.,
+                            empirical_protection_radius=4.,
+                            empirical_derivative_smoothing_sigma=0.,
+                            empirical_wing_zero_width=2,
+                            empirical_max_iterations=25,
+                            empirical_convergence_tolerance=1.e-3):
         
         with fits.open(os.path.join(self.outpath, file)) as hdu:
             hdr = hdu[0].header
@@ -1775,9 +1796,9 @@ class CriresPipeline:
         else:
             f0 = None
 
-        if extraction_mode not in ('optimal', 'joint_psf'):
-            raise ValueError("extraction_mode must be 'optimal' or 'joint_psf'")
-        if extraction_mode == 'joint_psf':
+        if extraction_mode not in ('optimal', 'joint_psf', 'joint_empirical'):
+            raise ValueError("unknown extraction_mode")
+        if extraction_mode in ('joint_psf', 'joint_empirical'):
             if companion_sep is None:
                 raise ValueError("joint_psf extraction requires companion_sep")
             result = self._loop_over_detector(
@@ -1789,11 +1810,24 @@ class CriresPipeline:
                 polynomial_degree=psf_polynomial_degree,
                 interpolate_psf=interpolate_psf,
                 fit_individual_channels=fit_individual_channels,
-                background=joint_background, debug=debug)
+                background=joint_background, debug=debug,
+                empirical=(extraction_mode == 'joint_empirical'),
+                empirical_spatial_lambda=empirical_spatial_lambda,
+                empirical_wavelength_lambda=empirical_wavelength_lambda,
+                empirical_protection_radius=empirical_protection_radius,
+                empirical_derivative_smoothing_sigma=empirical_derivative_smoothing_sigma,
+                empirical_wing_zero_width=empirical_wing_zero_width,
+                empirical_max_iterations=empirical_max_iterations,
+                empirical_convergence_tolerance=empirical_convergence_tolerance)
             flux_pri, err_pri, flux_sec, err_sec, diagnostics = result
             joint_header = hdr.copy()
-            joint_header['EXTRMODE'] = ('JOINTPSF', 'simultaneous shared-PSF extraction')
-            joint_header['PSFGAUSS'] = (psf_components, 'concentric Gaussian components')
+            empirical = extraction_mode == 'joint_empirical'
+            joint_header['EXTRMODE'] = ('JOINTEMP' if empirical else 'JOINTPSF',
+                                        'simultaneous shared-PSF extraction')
+            joint_header['PSFMODEL'] = ('EMPIRICAL' if empirical else 'GAUSSMIX',
+                                        'shared spatial PSF model')
+            if not empirical:
+                joint_header['PSFGAUSS'] = (psf_components, 'concentric Gaussian components')
             joint_header['SEPASEC'] = (companion_sep, 'fixed source separation [arcsec]')
             joint_header['SEPPIX'] = (companion_sep/self.pix_scale,
                                       'fixed source separation [pixel]')
@@ -1807,6 +1841,33 @@ class CriresPipeline:
             joint_header['BKGDMOD'] = (joint_background, 'simultaneous spatial background')
             joint_header['ERRMETH'] = ('WLSCOV+CHI2', 'covariance; chi2 inflation if >1')
             joint_header['BARYCOR'] = (False, 'wavelength correction is a later step')
+            if empirical:
+                joint_header['SPATREG'] = (empirical_spatial_lambda,
+                                           'empirical spatial D2 penalty')
+                joint_header['WAVEREG'] = (empirical_wavelength_lambda,
+                                           'empirical wavelength D2 penalty')
+                joint_header['PROTRAD'] = (empirical_protection_radius,
+                                           'companion protection radius [pixel]')
+                joint_header['DERSMOOT'] = (empirical_derivative_smoothing_sigma,
+                                            'spatial derivative smoothing sigma [pixel]')
+                joint_header['WINGZERO'] = (empirical_wing_zero_width,
+                                            'pixels tapered to zero at each PSF edge')
+                joint_header['CENREG'] = (True,
+                                          'subpixel centroid registered PSF shapes')
+                joint_header['BADCLIP'] = (10.,
+                                           'delayed empirical outlier threshold [sigma]')
+                joint_header['MAXITER'] = (empirical_max_iterations,
+                                           'maximum empirical iterations')
+                joint_header['CONVTOL'] = (empirical_convergence_tolerance,
+                                           'empirical convergence tolerance')
+                iteration_values = [x['iterations'] for detector in diagnostics
+                                    for x in detector]
+                convergence_values = [x['converged'] for detector in diagnostics
+                                      for x in detector]
+                joint_header['NITER'] = (max(iteration_values),
+                                         'maximum empirical iterations used')
+                joint_header['CONVERG'] = (float(np.mean(convergence_values)),
+                                           'fraction of segments converged')
             paths = file.split('/')
             base = paths[-1]
             label = savename or 'JOINTPSF'
@@ -1856,20 +1917,7 @@ class CriresPipeline:
                         values = item[field][indices]
                         stacked[detector_index, order_index, :, :values.shape[1]] = values
                 return stacked
-            nblocks = max(len(x['block_parameters']) for detector in diagnostics
-                          for x in detector)
-            block_centroid = np.full((len(diagnostics), len(diagnostics[0]), nblocks), np.nan)
-            block_widths = np.full((len(diagnostics), len(diagnostics[0]),
-                                    nblocks, psf_components), np.nan)
-            block_weights = np.full_like(block_widths, np.nan)
-            for detector_index, detector in enumerate(diagnostics):
-                for order_index, item in enumerate(detector):
-                    for block_index, values in enumerate(item['block_parameters']):
-                        block_centroid[detector_index, order_index, block_index] = values[2]
-                        block_widths[detector_index, order_index, block_index] = values[3]
-                        block_weights[detector_index, order_index, block_index] = values[4]
-            np.savez_compressed(
-                diagnostic_path,
+            diagnostic_payload = dict(
                 profile_data=stack_profile('data'),
                 profile_primary=stack_profile('primary_model'),
                 profile_companion=stack_profile('companion_model'),
@@ -1884,28 +1932,74 @@ class CriresPipeline:
                                         for detector in diagnostics]),
                 masked_fraction=np.asarray([[np.mean(x['mask']) for x in detector]
                                            for detector in diagnostics]),
-                block_centroid=block_centroid,
-                block_widths=block_widths,
-                block_weights=block_weights,
-                independent_block_parameters=np.asarray(
-                    [[x['independent_block_parameters'] for x in detector]
-                     for detector in diagnostics]),
-                polynomial_coefficients=np.asarray(
-                    [[x['polynomial_coefficients'] for x in detector]
-                     for detector in diagnostics]),
-                individual_channel_parameters=np.asarray(
-                    [[x['individual_channel_parameters'] for x in detector]
-                     for detector in diagnostics]),
-                individual_channel_cost=np.asarray(
-                    [[x['individual_channel_cost'] for x in detector]
-                     for detector in diagnostics]),
                 separation_pixels=companion_sep/self.pix_scale,
-                psf_components=psf_components,
                 psf_block_size=psf_block_size,
-                psf_polynomial_degree=(-1 if psf_polynomial_degree is None
-                                       else psf_polynomial_degree),
-                interpolate_psf=interpolate_psf,
                 background=joint_background)
+            if empirical:
+                def stack_empirical(field):
+                    values = [[np.asarray(x[field]) for x in detector]
+                              for detector in diagnostics]
+                    max_length = max(value.shape[0] for row in values for value in row)
+                    trailing = values[0][0].shape[1:]
+                    stacked = np.full((len(values), len(values[0]), max_length)+trailing,
+                                      np.nan)
+                    for detector_index, row in enumerate(values):
+                        for order_index, value in enumerate(row):
+                            stacked[(detector_index, order_index,
+                                     slice(0, value.shape[0]))] = value
+                    return stacked
+                for key in ('empirical_profiles', 'empirical_profile_history',
+                            'profile_change_history', 'companion_change_history',
+                            'block_centroids', 'channel_centroids',
+                            'centroid_history'):
+                    diagnostic_payload[key] = stack_empirical(key)
+                for key in ('iterations', 'converged'):
+                    diagnostic_payload[key] = np.asarray(
+                        [[x[key] for x in detector] for detector in diagnostics])
+                diagnostic_payload.update(
+                    psf_model='empirical',
+                    spatial_lambda=empirical_spatial_lambda,
+                    wavelength_lambda=empirical_wavelength_lambda,
+                    protection_radius=empirical_protection_radius,
+                    derivative_smoothing_sigma=empirical_derivative_smoothing_sigma,
+                    wing_zero_width=empirical_wing_zero_width,
+                    max_iterations=empirical_max_iterations,
+                    convergence_tolerance=empirical_convergence_tolerance)
+            else:
+                nblocks = max(len(x['block_parameters']) for detector in diagnostics
+                              for x in detector)
+                block_centroid = np.full(
+                    (len(diagnostics), len(diagnostics[0]), nblocks), np.nan)
+                block_widths = np.full(
+                    (len(diagnostics), len(diagnostics[0]), nblocks,
+                     psf_components), np.nan)
+                block_weights = np.full_like(block_widths, np.nan)
+                for detector_index, detector in enumerate(diagnostics):
+                    for order_index, item in enumerate(detector):
+                        for block_index, values in enumerate(item['block_parameters']):
+                            block_centroid[detector_index, order_index, block_index] = values[2]
+                            block_widths[detector_index, order_index, block_index] = values[3]
+                            block_weights[detector_index, order_index, block_index] = values[4]
+                diagnostic_payload.update(
+                    psf_model='gaussian_mixture', psf_components=psf_components,
+                    block_centroid=block_centroid, block_widths=block_widths,
+                    block_weights=block_weights,
+                    independent_block_parameters=np.asarray(
+                        [[x['independent_block_parameters'] for x in detector]
+                         for detector in diagnostics]),
+                    polynomial_coefficients=np.asarray(
+                        [[x['polynomial_coefficients'] for x in detector]
+                         for detector in diagnostics]),
+                    individual_channel_parameters=np.asarray(
+                        [[x['individual_channel_parameters'] for x in detector]
+                         for detector in diagnostics]),
+                    individual_channel_cost=np.asarray(
+                        [[x['individual_channel_cost'] for x in detector]
+                         for detector in diagnostics]),
+                    psf_polynomial_degree=(-1 if psf_polynomial_degree is None
+                                           else psf_polynomial_degree),
+                    interpolate_psf=interpolate_psf)
+            np.savez_compressed(diagnostic_path, **diagnostic_payload)
             self._add_to_product(diagnostic_relative_path,
                                  f'Extr2D_{filetype}_JOINTPSF')
             representative = diagnostics[0][len(diagnostics[0])//2]
@@ -1926,6 +2020,101 @@ class CriresPipeline:
             qc_orders = (1, 3, 5)
             qc_pixels = (410, 1090, 1775)
             for detector_index, detector in enumerate(diagnostics):
+                if empirical:
+                    fig, axes = plt.subplots(3, len(detector), figsize=(24, 10),
+                                             sharex='col')
+                    for order_index, item in enumerate(detector):
+                        flux = np.asarray(flux_sec[detector_index][order_index])
+                        finite_flux = np.isfinite(flux)
+                        median_flux = np.nanmedian(flux[finite_flux])
+                        candidates = np.flatnonzero(finite_flux)
+                        nearest = candidates[np.argsort(
+                            np.abs(flux[candidates]-median_flux))[:64]]
+                        residual_scale = np.asarray([
+                            np.nanmedian(np.abs(item['residual'][candidate]))
+                            for candidate in nearest])
+                        wave_index = nearest[np.nanargmin(residual_scale)]
+                        observed = item['data'][wave_index]
+                        primary_model = item['primary_model'][wave_index]
+                        companion_model = item['companion_model'][wave_index]
+                        background_model = item['background_model'][wave_index]
+                        total_model = primary_model+companion_model+background_model
+                        spatial = np.arange(observed.size)
+                        primary_center = int(np.nanargmax(primary_model))
+                        companion_center = int(round(primary_center-
+                                                     companion_sep/self.pix_scale))
+                        lo = max(0, companion_center-7)
+                        hi = min(observed.size, primary_center+8)
+                        selection = slice(lo, hi)
+                        top, middle, bottom = axes[:, order_index]
+                        top.plot(spatial[selection], observed[selection], 'o', ms=3,
+                                 color='black', label='unbinned data')
+                        top.plot(spatial[selection], total_model[selection],
+                                 color='tab:red', label='total model')
+                        top.plot(spatial[selection], primary_model[selection],
+                                 color='tab:blue', label='primary')
+                        top.plot(spatial[selection], companion_model[selection],
+                                 color='tab:orange', label='companion')
+                        top.plot(spatial[selection], background_model[selection],
+                                 color='tab:green', label='background')
+                        zoom_values = np.r_[observed[lo:max(lo+2, primary_center-3)],
+                                            total_model[lo:max(lo+2, primary_center-3)]]
+                        zoom_values = zoom_values[np.isfinite(zoom_values)]
+                        if zoom_values.size:
+                            low, high = np.percentile(zoom_values, (2, 98))
+                            padding = max(0.15*(high-low), 1.)
+                            top.set_ylim(low-padding, high+padding)
+                        primary_subtracted = observed-primary_model-background_model
+                        companion_zoom = slice(max(lo, companion_center-5),
+                                               min(hi, companion_center+6))
+                        middle.axhline(0., color='0.6', lw=0.8)
+                        middle.plot(spatial[companion_zoom],
+                                    primary_subtracted[companion_zoom], 'o', ms=3,
+                                    color='black', label='data-primary-background')
+                        middle.plot(spatial[companion_zoom],
+                                    companion_model[companion_zoom],
+                                    color='tab:orange', label='companion model')
+                        bottom.axhline(0., color='0.6', lw=0.8)
+                        bottom.plot(spatial[selection],
+                                    item['residual'][wave_index, selection], 'o-',
+                                    ms=2., lw=0.7, color='black')
+                        top.set_title(f'Order {order_index}\npixel {wave_index}')
+                        bottom.set_xlabel('Spatial pixel')
+                    axes[0, 0].set_ylabel('Counts (peak clipped)')
+                    axes[1, 0].set_ylabel('Companion region')
+                    axes[2, 0].set_ylabel('Residual')
+                    handles, labels = axes[0, 0].get_legend_handles_labels()
+                    fig.legend(handles, labels, loc='upper center', ncol=5)
+                    fig.suptitle(f'{base}: empirical PSF, detector {detector_index+1}',
+                                 y=0.995)
+                    fig.tight_layout(rect=(0, 0, 1, 0.95))
+                    fig.savefig(diagnostic_path[:-4]+
+                                f'_fullres_detector{detector_index+1}.png',
+                                dpi=180, bbox_inches='tight')
+                    plt.close(fig)
+
+                    fig, axes = plt.subplots(2, 1, figsize=(10, 9))
+                    representative_order = detector[len(detector)//2]
+                    profiles = representative_order['empirical_profiles']
+                    for block_index, profile in enumerate(profiles):
+                        axes[0].plot(profile, alpha=0.35,
+                                     color=plt.cm.viridis(block_index/max(len(profiles)-1, 1)))
+                    axes[0].set(title='Normalized empirical PSFs by wavelength block',
+                                ylabel='Unit-integrated profile')
+                    axes[1].semilogy(representative_order['profile_change_history'],
+                                     'o-', label='maximum profile L1 change')
+                    axes[1].semilogy(representative_order['companion_change_history'],
+                                     'o-', label='median companion-flux change')
+                    axes[1].axhline(empirical_convergence_tolerance, color='black',
+                                    ls=':', label='tolerance')
+                    axes[1].set(xlabel='Iteration', ylabel='Fractional change')
+                    axes[1].legend()
+                    fig.tight_layout()
+                    fig.savefig(diagnostic_path[:-4]+
+                                f'_empirical_psf_detector{detector_index+1}.png',
+                                dpi=180, bbox_inches='tight')
+                    plt.close(fig)
+                    continue
                 fig = plt.figure(figsize=(15, 18))
                 grid = fig.add_gridspec(
                     6, 3, height_ratios=(3, 1, 3, 1, 3, 1),
